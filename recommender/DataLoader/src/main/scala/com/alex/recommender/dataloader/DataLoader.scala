@@ -1,11 +1,22 @@
 package com.alex.recommender.dataloader
 
 
+import java.net.InetAddress
+
 import com.mongodb.casbah.commons.MongoDBObject
 import com.mongodb.casbah.{MongoClient, MongoClientURI}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.{SparkConf, SparkContext}
+import org.elasticsearch.action.ActionFuture
+import org.elasticsearch.action.admin.indices.create.CreateIndexRequest
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest
+import org.elasticsearch.action.admin.indices.exists.indices.{IndicesExistsRequest, IndicesExistsResponse}
+import org.elasticsearch.common.settings.Settings
+import org.elasticsearch.common.transport.TransportAddress
+import org.elasticsearch.transport.client.PreBuiltTransportClient
+
+import scala.util.matching.Regex
 
 /**
   * movie 数据集以^分割
@@ -51,9 +62,9 @@ case class ESConfig(httpHosts: String, transportHosts: String, index: String,
 object DataLoader {
 
   // 以window下为例，需替换成自己的路径，linux下为 /YOUR_PATH/resources/movies.csv
-  val MOVIE_DATA_PATH = " C:\\workspace\\MovieRecommendsSystem\\recommender\\DataLoader\\src\\main\\resources\\movies.csv"
-  val RATING_DATA_PATH = " C:\\workspace\\MovieRecommendsSystem\\recommender\\DataLoader\\src\\main\\resources\\ratings.csv"
-  val TAG_DATA_PATH = "C:\\workspace\\MovieRecommendsSystem\\recommender\\DataLoader\\src\\main\\resources\\tags.csv"
+  val MOVIE_DATA_PATH = "D:\\Workspace\\recommender\\movies.csv"
+  val RATING_DATA_PATH = "D:\\Workspace\\recommender\\ratings.csv"
+  val TAG_DATA_PATH = "D:\\Workspace\\recommender\\tags.csv"
 
   val MONGODB_MOVIE_COLLECTION = "Movie"
   val MONGODB_RATING_COLLECTION = "Rating"
@@ -66,19 +77,20 @@ object DataLoader {
     // 定义用到的配置参数
     val config = Map(
       "spark.cores" -> "local[*]",
-      "mongo.uri" -> "mongodb://localhost:27017/recommender",
+      "mongo.uri" -> "mongodb://192.168.1.106:27017/recommender",
       "mongo.db" -> "recommender",
-      "es.httpHosts" -> "localhost:9200",
-      "es.transportHosts" -> "localhost:9300",
+      "es.httpHosts" -> "hadoop102:9200",
+      "es.transportHosts" -> "hadoop102:9300,hadoop103:9300",
       "es.index" -> "recommender",
-      "es.cluster.name" -> "elasticsearch"
+      "es.cluster.name" -> "my-es"
     )
 
 
-    val sparkConf: SparkConf = new SparkConf().setMaster(config.get("spark.cores").get).setAppName("recommender")
+    val sparkConf: SparkConf = new SparkConf().setMaster(config.get("spark.cores").get).setAppName("recommender1")
     //val sc = new SparkContext(sparkConf)
     val sparkSession: SparkSession = SparkSession.builder().config(sparkConf).getOrCreate()
     import sparkSession.implicits._
+
 
 
     //加载数据
@@ -110,31 +122,74 @@ object DataLoader {
       MongoConfig(config.get("mongo.uri").get, config.get("mongo.db").get)
 
 
+
     //保存到数据库mongodb
-    storeDataInMongoDB(movieDF, ratingDF, tagDF)
+    //storeDataInMongoDB(movieDF, ratingDF, tagDF)
 
 
     import org.apache.spark.sql.functions._
-//    希望tag转换为  mid, tags(tag1|tag2...)这样的数据格式
+
+    //        希望tag转换为  mid, tags(tag1|tag2...)这样的数据格式
     val newTagDF: DataFrame = tagDF.groupBy($"mid")
       .agg(concat_ws("|", collect_set($"tag")).as("tags"))
       .select("mid", "tags")
-    //注意第二个参数需要seq
-    movieDF.join(newTagDF,Seq("mid"),"left")
+    //注意第二个参数需要seq, 把movie和tag连接成一个表提高检索效率
+    val movietagsDF: DataFrame = movieDF.join(newTagDF, Seq("mid"), "left")
 
 
-
-
-
-
-
-
+    implicit val eSConfig = ESConfig(config.get("es.httpHosts").get,
+                                      config.get("es.transportHosts").get,
+                                      config.get("es.index").get,
+                                      config.get("es.cluster.name").get
+    )
     //保存到ES
+    storeDataInES(movietagsDF)
 
 
 
     //关闭spark
     sparkSession.stop()
+
+
+  }
+
+  def storeDataInES(movieDF:DataFrame)(implicit eSConfig: ESConfig): Unit = {
+    //配置
+    val settings: Settings = Settings.builder().put("cluster.name",eSConfig.clustername).build()
+    //新建一个ES客户端
+    val client = new PreBuiltTransportClient(settings)
+
+    //需要将TransportHosts添加到esClient中
+    val REGEX_HOST_PORT: Regex = "(.+):(\\d+)".r
+
+    eSConfig.transportHosts.split(",").foreach{
+      case REGEX_HOST_PORT(host:String,port:String)=>{
+        //注意新老API的区别
+        //client.addTransportAddress( new InetSocketTransportAddress(InetAddress.getByName(host),port.toInt))
+        client.addTransportAddress( new TransportAddress(InetAddress.getByName(host),port.toInt))
+      }
+
+    }
+
+    println(client)
+    //如果有数据就清除原来的数据
+    if(client.admin().indices().exists(new IndicesExistsRequest(eSConfig.index)).actionGet().isExists){
+      client.admin().indices().delete(new DeleteIndexRequest(eSConfig.index))
+    }
+
+    client.admin().indices().create(new CreateIndexRequest(eSConfig.index))
+
+    //写入到ES
+
+    movieDF.write
+      .option("es.nodes",eSConfig.httpHosts)
+      .option("es.http.timeout","100m")
+      .option("es.mapping.id","mid")
+      .mode("overwrite")
+      .format("org.elasticsearch.spark.sql")
+      .save(eSConfig.index+"/"+ES_MOVIE_INDEX)
+
+    client.close()
 
 
   }
@@ -171,7 +226,7 @@ object DataLoader {
       .format("com.mongodb.spark.sql")
       .save()
 
-    //建立索引
+//    //建立索引
     mongoClient(mongoConfig.db)(MONGODB_MOVIE_COLLECTION).createIndex(MongoDBObject("mid"->1))
     mongoClient(mongoConfig.db)(MONGODB_RATING_COLLECTION).createIndex(MongoDBObject("uid" -> 1))
     mongoClient(mongoConfig.db)(MONGODB_RATING_COLLECTION).createIndex(MongoDBObject("mid" -> 1))
